@@ -36,3 +36,6 @@ desktop.ini
 htmlcov/
 .cache/
 
+# Local overrides
+*.local.json
+*.local.yaml
