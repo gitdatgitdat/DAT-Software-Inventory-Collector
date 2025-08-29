@@ -1,9 +1,12 @@
 import argparse
 import csv
+import getpass
 import json
+import os
 import socket
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -181,19 +184,81 @@ def diff_inventories(old_items: list, new_items: list):
                             "scope": n.get("scope"), "from": o.get("version"), "to": n.get("version")})
     return added, removed, changed
 
+def _ensure_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+
+def _log_path(log_dir: str, kind: str) -> str:
+    """
+    kind: 'jsonl' or 'txt'
+    File is rotated daily: logs/2025-08-25.jsonl
+    """
+    _ensure_dir(log_dir)
+    stamp = datetime.now().strftime("%Y-%m-%d")
+    ext = "jsonl" if kind == "jsonl" else "log"
+    return os.path.join(log_dir, f"{stamp}.{ext}")
+
+def write_run_log(*, args, out_path: str, out_format: str, count: int,
+                  started: float, ended: float, error: str | None = None) -> None:
+    rec = {
+        "ts": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "host": socket.gethostname(),
+        "user": getpass.getuser(),
+        "duration_s": round(ended - started, 3),
+        "output_file": out_path,
+        "output_format": out_format,
+        "record_count": count,
+        "status": "error" if error else "ok",
+        "error": error,
+        "log_dir": args.log_dir,
+        "log_format": args.log_format,
+        "cmd": " ".join(os.sys.argv),
+    }
+    path = _log_path(args.log_dir, args.log_format)
+    if args.log_format == "jsonl":
+        line = json.dumps(rec, ensure_ascii=False)
+    else:
+        line = (f"{rec['ts']} host={rec['host']} user={rec['user']} "
+                f"status={rec['status']} count={count} dur={rec['duration_s']}s "
+                f"out='{out_path}' fmt={out_format}" + (f" err='{error}'" if error else ""))
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(line + "\n")
+
 def parse_args():
     ap = argparse.ArgumentParser(description="Software Inventory Collector (Windows)")
     ap.add_argument("--json", help="Write inventory to JSON file")
     ap.add_argument("--csv", help="Write inventory to CSV file")
     ap.add_argument("--include-system", action="store_true", help="Include system components (hidden entries)")
     ap.add_argument("--include-store", action="store_true", help="Include Microsoft Store (Appx) apps")
+    ap.add_argument("--log-dir", default="logs", help="Directory to write run logs (default: logs)")
+    ap.add_argument("--log-format", choices=["jsonl", "txt"], default="jsonl", help="Run log format (default: jsonl)")
+    ap.add_argument("--no-console", action="store_true", help="(Reserved) suppress console prints")
     ap.add_argument("--diff", nargs=2, metavar=("OLD.json", "NEW.json"),
                     help="Compare two JSON inventories and print added/removed/changed")
     return ap.parse_args()
 
+def _outputs_from_args(args) -> tuple[str, str]:
+    """
+    Return (out_path, out_fmt) for logging.
+    - If both JSON and CSV were written, join with ';' and set format 'json,csv'.
+    - If neither was requested, we log 'none'.
+    """
+    outs = []
+    if args.json:
+        outs.append(("json", str(Path(args.json).expanduser().resolve())))
+    if args.csv:
+        outs.append(("csv", str(Path(args.csv).expanduser().resolve())))
+    if not outs:
+        return ("-", "none")
+    if len(outs) == 1:
+        return (outs[0][1], outs[0][0])
+    # both
+    return (";".join(p for _, p in outs), "json,csv")
+
+
 def main():
     args = parse_args()
 
+    # If doing a diff, do it and exit (no run log for diffs by design).
     if args.diff:
         old_path = Path(args.diff[0]).expanduser().resolve()
         new_path = Path(args.diff[1]).expanduser().resolve()
@@ -221,33 +286,57 @@ def main():
         print()
         return
 
-    # Collect current inventory
-    items = collect_registry(include_system=args.include_system)
-    if args.include_store:
-        items.extend(collect_store_apps())
+    started = time.perf_counter()
+    error_msg = None
+    count = 0
 
-    # Sort by name then publisher
-    items.sort(key=lambda r: ((r.get("name") or "").lower(), (r.get("publisher") or "").lower()))
-    meta = host_metadata()
-    print(f"[OK] Collected {len(items)} entries on {meta['hostname']}.")
+    try:
+        # Collect current inventory
+        items = collect_registry(include_system=args.include_system)
+        if args.include_store:
+            items.extend(collect_store_apps())
 
-    if args.json:
-        out = Path(args.json).expanduser().resolve()
-        out.parent.mkdir(parents=True, exist_ok=True)
-        write_json(out, items, meta)
-        print(f"[OK] Wrote JSON: {out}")
-    if args.csv:
-        out = Path(args.csv).expanduser().resolve()
-        out.parent.mkdir(parents=True, exist_ok=True)
-        write_csv(out, items)
-        print(f"[OK] Wrote CSV : {out}")
+        # Sort for stable output
+        items.sort(key=lambda r: ((r.get("name") or "").lower(),
+                                  (r.get("publisher") or "").lower()))
+        count = len(items)
+        meta = host_metadata()
+        print(f"[OK] Collected {count} entries on {meta['hostname']}.")
 
-    if not args.json and not args.csv:
-        # Print a few lines to screen
-        for r in items[:25]:
-            ver = r.get("version") or "-"
-            pub = r.get("publisher") or "-"
-            print(f"  {r.get('name')}  {ver}  ({pub})  [{r.get('scope')}/{r.get('view')}]")
+        # Write outputs
+        if args.json:
+            out = Path(args.json).expanduser().resolve()
+            out.parent.mkdir(parents=True, exist_ok=True)
+            write_json(out, items, meta)
+            print(f"[OK] Wrote JSON: {out}")
+        if args.csv:
+            out = Path(args.csv).expanduser().resolve()
+            out.parent.mkdir(parents=True, exist_ok=True)
+            write_csv(out, items)
+            print(f"[OK] Wrote CSV : {out}")
+
+        # If no output flags, print a small preview
+        if not args.json and not args.csv:
+            for r in items[:25]:
+                ver = r.get("version") or "-"
+                pub = r.get("publisher") or "-"
+                print(f"  {r.get('name')}  {ver}  ({pub})  [{r.get('scope')}/{r.get('view')}]")
+
+    except Exception as e:
+        error_msg = str(e)
+        raise
+    finally:
+        ended = time.perf_counter()
+        out_path, out_fmt = _outputs_from_args(args)
+        write_run_log(
+            args=args,
+            out_path=out_path,
+            out_format=out_fmt,
+            count=count,
+            started=started,
+            ended=ended,
+            error=error_msg,
+        )
 
 if __name__ == "__main__":
     main()
