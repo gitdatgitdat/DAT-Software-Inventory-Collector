@@ -197,6 +197,22 @@ def _log_path(log_dir: str, kind: str) -> str:
     ext = "jsonl" if kind == "jsonl" else "log"
     return os.path.join(log_dir, f"{stamp}.{ext}")
 
+def _history_path(history_dir: str, host: str) -> Path:
+    """
+    Make path like: history/2025-08-29_142530_HOST.json
+    """
+    Path(history_dir).mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    safe_host = "".join(ch if ch.isalnum() or ch in "-._" else "_" for ch in host)
+    return Path(history_dir) / f"{stamp}_{safe_host}.json"
+
+def _latest_history_file(history_dir: str) -> Optional[Path]:
+    p = Path(history_dir)
+    if not p.exists():
+        return None
+    files = sorted(p.glob("*.json"))
+    return files[-1] if files else None
+
 def write_run_log(*, args, out_path: str, out_format: str, count: int,
                   started: float, ended: float, error: str | None = None) -> None:
     rec = {
@@ -234,6 +250,12 @@ def parse_args():
     ap.add_argument("--no-console", action="store_true", help="(Reserved) suppress console prints")
     ap.add_argument("--diff", nargs=2, metavar=("OLD.json", "NEW.json"),
                     help="Compare two JSON inventories and print added/removed/changed")
+    ap.add_argument("--history", action="store_true",
+                help="Save a timestamped snapshot of this run into the history directory.")
+    ap.add_argument("--history-dir", default="history",
+                help="Directory for timestamped snapshots (default: history).")
+    ap.add_argument("--diff-last", action="store_true",
+                help="After collecting, diff against the most recent history snapshot (if any).")
     return ap.parse_args()
 
 def _outputs_from_args(args) -> tuple[str, str]:
@@ -337,6 +359,48 @@ def main():
             ended=ended,
             error=error_msg,
         )
+
+    history_out = None
+    if args.history:
+        history_out = _history_path(args.history_dir, meta["hostname"])
+        write_json(history_out, items, meta)
+        print(f"[OK] Saved history snapshot: {history_out}")
+
+    if args.diff_last:
+        # Prefer newest saved snapshot from this run; otherwise use latest existing
+        base_file = _latest_history_file(args.history_dir)
+        # If we just saved one, that *is* the latest; pick the previous instead
+        if base_file and history_out and base_file == history_out:
+            # find the one before the latest
+            all_files = sorted(Path(args.history_dir).glob("*.json"))
+            base_file = all_files[-2] if len(all_files) >= 2 else None
+        if not base_file:
+            print("[INFO] No prior history snapshot to diff against.")
+        if args.diff_last and not base_file:
+            print(f"[INFO] No snapshots found in {args.history_dir}. Run with --history first.")    
+        else:
+            old_items = load_inv(base_file)
+            added, removed, changed = diff_inventories(old_items, items)
+
+            print("\n=== Diff vs last snapshot ===")
+            print(f"Base   : {base_file.name}")
+            print(f"Added  : {len(added)}")
+            print(f"Removed: {len(removed)}")
+            print(f"Changed: {len(changed)}\n")
+
+            if added:
+                print("Added:")
+                for a in added[:50]:
+                    print(f"  + {a.get('name')}  {a.get('version')}  [{a.get('scope')}/{a.get('view')}]")
+            if removed:
+                print("\nRemoved:")
+                for r in removed[:50]:
+                    print(f"  - {r.get('name')}  {r.get('version')}  [{r.get('scope')}/{r.get('view')}]")
+            if changed:
+                print("\nChanged (version):")
+                for c in changed[:100]:
+                    print(f"  * {c['name']}  {c['from']} -> {c['to']}  [{c['scope']}]")
+            print()
 
 if __name__ == "__main__":
     main()
