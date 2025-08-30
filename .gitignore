@@ -18,8 +18,10 @@ dist/
 
 # Logs and local output
 logs/
+history/
 out/
 *.log
+*.jsonl
 
 # OS-generated files
 .DS_Store
